@@ -656,7 +656,7 @@ local function tpHard(target)
     return walkToObject(target, { onTop = true, maxAttempts = 3, teleportFallback = true })
 end
 
--- Шукає Claim ProximityPrompt біля гравця
+-- Шукає Claim ProximityPrompt біля гравця і фірить його всіма способами
 local function tryClaimPrompts()
     for _, prompt in ipairs(Workspace:GetDescendants()) do
         if prompt:IsA("ProximityPrompt") and prompt.Enabled then
@@ -669,10 +669,63 @@ local function tryClaimPrompts()
                 local txt = (prompt.ActionText or "") .. " " .. (prompt.ObjectText or "")
                 if txt:lower():find("claim") or txt:lower():find("hive") then
                     pcall(function() fireproximityprompt(prompt) end)
+                    -- Якщо fireproximityprompt не доступний — спроба через :InputHoldBegin
+                    pcall(function() prompt:InputHoldBegin() task.wait(0.6) prompt:InputHoldEnd() end)
                 end
             end
         end
     end
+end
+
+-- Натискання on-screen prompt UI (для мобілки — там кнопка з'являється)
+local function tapOnScreenButtons(keywords)
+    keywords = keywords or { "claim", "convert", "collect", "interact" }
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return false end
+    local hit = false
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+            local t = ((d.Text or "") .. " " .. (d.Name or "")):lower()
+            for _, kw in ipairs(keywords) do
+                if t:find(kw) then
+                    -- Спроба 1: Activated (працює на тач)
+                    pcall(function() d:Activate() end)
+                    -- Спроба 2: симуляція кліку через VIM на центрі кнопки
+                    if VIM then
+                        local pos = d.AbsolutePosition
+                        local size = d.AbsoluteSize
+                        local cx = pos.X + size.X / 2
+                        local cy = pos.Y + size.Y / 2
+                        pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, true, game, 0) end)
+                        task.wait(0.05)
+                        pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0) end)
+                        -- На мобілці краще Touch event
+                        pcall(function()
+                            VIM:SendTouchEvent(1, 0, cx, cy)  -- touch start
+                            task.wait(0.05)
+                            VIM:SendTouchEvent(1, 2, cx, cy)  -- touch end
+                        end)
+                    end
+                    hit = true
+                    break
+                end
+            end
+        end
+    end
+    return hit
+end
+
+-- Симуляція тачу в центрі екрану (там де зазвичай on-screen prompt button)
+local function tapScreenCenter()
+    if not VIM then return end
+    local cx = VP.X / 2
+    local cy = VP.Y * 0.6  -- трохи нижче центру — там зазвичай prompt
+    pcall(function() VIM:SendTouchEvent(1, 0, cx, cy) end)
+    task.wait(0.08)
+    pcall(function() VIM:SendTouchEvent(1, 2, cx, cy) end)
+    pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, true, game, 0) end)
+    task.wait(0.05)
+    pcall(function() VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0) end)
 end
 
 -- Перевіряє чи реально на вулику стоїмо (для claim)
@@ -706,30 +759,49 @@ local function ensureHiveClaimed()
         return nil
     end
 
-    task.wait(0.5)
+    task.wait(0.8)
 
     -- Спам усіх способів claim'у
     for attempt = 1, 15 do
         if not state.running then break end
+
+        -- 1) Клавіша E (для PC executor'ів)
         tap(0x45, 0.05)
+
+        -- 2) ProximityPrompt всіма способами
         tryClaimPrompts()
         fireProximityPromptsNearby(25)
 
+        -- 3) ClickDetector
         for _, cd in ipairs(empty:GetDescendants()) do
             if cd:IsA("ClickDetector") then
                 pcall(function() fireclickdetector(cd) end)
             end
         end
 
+        -- 4) ON-SCREEN button через PlayerGui (це для мобілки!)
+        tapOnScreenButtons({ "claim", "hive" })
+
+        -- 5) Симуляція тачу по центру екрану (де prompt button)
+        tapScreenCenter()
+
+        -- 6) Touched-based check: симулюємо що ми торкнулись частини hive
+        for _, part in ipairs(empty:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanTouch ~= false then
+                pcall(function() firetouchinterest(hrp, part, 0) end)
+                pcall(function() firetouchinterest(hrp, part, 1) end)
+            end
+        end
+
         mine = findMyHive()
         if mine then break end
 
-        -- Якщо випали з hive — підходимо знову (walk, не tp)
+        -- Якщо випали з hive — підходимо знову
         local hivePos = empty:GetPivot().Position
         if (hrp.Position - hivePos).Magnitude > 15 then
-            walkToObject(empty, { onTop = true, maxAttempts = 1, teleportFallback = false })
+            walkToObject(empty, { onTop = true, maxAttempts = 1, teleportFallback = true })
         end
-        task.wait(0.3)
+        task.wait(0.4)
     end
 
     if mine then
@@ -972,11 +1044,18 @@ end
 ------------------------------------------------------------
 local function eSpam()
     task.spawn(function()
+        local mobileTickCounter = 0
         while state.running do
             if not state.paused and not state.inDanger then
                 tap(0x45, 0.02)
-                -- Дублюємо через ProximityPrompt для мобілок
-                if PLATFORM.Mobile then fireProximityPromptsNearby(14) end
+                -- На мобілці — додатково ProximityPrompt і on-screen прости (рідше)
+                if PLATFORM.Mobile then
+                    fireProximityPromptsNearby(14)
+                    mobileTickCounter = mobileTickCounter + 1
+                    if mobileTickCounter % 5 == 0 then
+                        pcall(tapOnScreenButtons, { "interact", "collect" })
+                    end
+                end
             end
             task.wait(CFG.EClickInterval)
         end
@@ -1759,18 +1838,20 @@ end
 
 local function convertAtHive()
     if not hive then return end
-    -- ХОДИМО до hive (walk, не tp)
+    -- ХОДИМО до hive
     walkToObject(hive, { onTop = true, maxAttempts = 3, teleportFallback = true })
     task.wait(0.5)
-    -- Перевірка дистанції
     local hivePos = hive:GetPivot().Position
     if (hrp.Position - hivePos).Magnitude > 20 then
         walkToObject(hive, { onTop = true, maxAttempts = 2, teleportFallback = true })
     end
-    -- Конвертація: спам E + ProximityPrompt
-    for _ = 1, 12 do
+
+    -- Конвертація: всі способи (E + ProximityPrompt + UI button + screen tap)
+    for _ = 1, 14 do
         tap(0x45, 0.05)
-        fireProximityPromptsNearby(20)
+        fireProximityPromptsNearby(25)
+        tapOnScreenButtons({ "convert", "claim" })
+        tapScreenCenter()
         task.wait(0.25)
     end
     task.wait(0.5)
