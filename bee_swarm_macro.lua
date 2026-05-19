@@ -65,7 +65,12 @@ print(string.format("[BSS Macro] Platform: %s | Viewport: %dx%d",
 ------------------------------------------------------------
 -- DEBUG TOAST (з'являється одразу після виконання скрипта)
 ------------------------------------------------------------
+local toastCount = 0
 local function debugToast(text, color, duration)
+    -- Throttle: не більше 6 одночасно
+    if toastCount > 6 then return end
+    toastCount = toastCount + 1
+
     local pg = LP:FindFirstChildOfClass("PlayerGui") or LP:WaitForChild("PlayerGui")
     local sg = Instance.new("ScreenGui")
     sg.Name = "BSSDebugToast_" .. tostring(math.random(1,99999))
@@ -91,7 +96,10 @@ local function debugToast(text, color, duration)
     lbl.ZIndex = 999
     Instance.new("UICorner", lbl).CornerRadius = UDim.new(0, 8)
 
-    task.delay(duration or 4, function() sg:Destroy() end)
+    task.delay(duration or 4, function()
+        sg:Destroy()
+        toastCount = math.max(0, toastCount - 1)
+    end)
 end
 
 debugToast("🐝 BSS Macro: СКРИПТ ЗАПУЩЕНО", Color3.fromRGB(60, 180, 100), 3)
@@ -410,15 +418,19 @@ end
 
 -- Pathfinding (обхід перешкод)
 local function walkPath(targetPos)
-    local path = PathfindingService:CreatePath({
-        AgentRadius = 2,
-        AgentHeight = 5,
-        AgentCanJump = true,
-        AgentJumpHeight = 7,
-        AgentMaxSlope = 45,
-    })
-    local ok = pcall(function() path:ComputeAsync(hrp.Position, targetPos) end)
-    if not ok or path.Status ~= Enum.PathStatus.Success then
+    if not hrp or not hum then return false end
+    local ok1, path = pcall(function()
+        return PathfindingService:CreatePath({
+            AgentRadius = 2,
+            AgentHeight = 5,
+            AgentCanJump = true,
+            AgentJumpHeight = 7,
+            AgentMaxSlope = 45,
+        })
+    end)
+    if not ok1 or not path then return walkToPoint(targetPos) end
+    local ok2 = pcall(function() path:ComputeAsync(hrp.Position, targetPos) end)
+    if not ok2 or path.Status ~= Enum.PathStatus.Success then
         return walkToPoint(targetPos)  -- fallback на пряму ходу
     end
     for _, wp in ipairs(path:GetWaypoints()) do
@@ -547,7 +559,15 @@ local function findMyHive()
     if not hives then return nil end
     for _, h in ipairs(hives:GetChildren()) do
         local owner = h:FindFirstChild("Owner")
-        if (owner and owner.Value == LP) or h.Name == LP.Name then return h end
+        if owner then
+            local v = owner.Value
+            -- ObjectValue Player
+            if typeof(v) == "Instance" and v == LP then return h end
+            -- StringValue / NumberValue з ім'ям/ID гравця
+            if typeof(v) == "string" and (v == LP.Name or v == tostring(LP.UserId)) then return h end
+            if typeof(v) == "number" and v == LP.UserId then return h end
+        end
+        if h.Name == LP.Name then return h end
     end
     return nil
 end
@@ -558,9 +578,16 @@ local function findEmptyHive()
     if not hives then return nil end
     for _, h in ipairs(hives:GetChildren()) do
         local owner = h:FindFirstChild("Owner")
-        if owner and (owner.Value == nil or owner.Value == "") then
-            return h
+        local taken = false
+        if owner then
+            local v = owner.Value
+            -- ObjectValue (Player) | StringValue | bool
+            if typeof(v) == "Instance" and v:IsA("Player") then taken = true
+            elseif typeof(v) == "string" and v ~= "" then taken = true
+            elseif typeof(v) == "boolean" and v then taken = true
+            end
         end
+        if not taken then return h end
     end
     return nil
 end
@@ -969,9 +996,15 @@ local function snakeMove(duration)
 end
 
 ------------------------------------------------------------
--- ДЕТЕКТОР НЕБЕЗПЕКИ
+-- FORWARD-DECLARED MAIN STATE (потрібно для функцій нижче)
 ------------------------------------------------------------
 local hive
+local fields     = {}
+local dispensers = {}
+
+------------------------------------------------------------
+-- ДЕТЕКТОР НЕБЕЗПЕКИ
+------------------------------------------------------------
 local function dangerWatcher()
     task.spawn(function()
         while state.running do
@@ -1103,8 +1136,19 @@ end
 
 local function recordTokenSpawn(fieldName, pos)
     if not heatmap[fieldName] then heatmap[fieldName] = {} end
+    local h = heatmap[fieldName]
     local k = heatKey(pos)
-    heatmap[fieldName][k] = (heatmap[fieldName][k] or 0) + 1
+    h[k] = (h[k] or 0) + 1
+
+    -- Memory cap: якщо клітинок > 200, decay всі (помножимо на 0.9, видалимо < 1)
+    local count = 0
+    for _ in pairs(h) do count = count + 1 end
+    if count > 200 then
+        for kk, vv in pairs(h) do
+            local nv = vv * 0.9
+            if nv < 1 then h[kk] = nil else h[kk] = nv end
+        end
+    end
 end
 
 -- Найгарячіша точка на полі
@@ -1319,6 +1363,11 @@ local function addGoal(id, gType, priority, ttl, data)
         expires = ttl and (tick() + ttl) or math.huge,
         data = data or {}
     })
+    -- Cap: тримаємо не більше 20 цілей (найвищим пріоритетом)
+    if #goals > 20 then
+        table.sort(goals, function(a, b) return a.priority > b.priority end)
+        while #goals > 20 do table.remove(goals) end
+    end
 end
 
 local function removeGoal(id)
@@ -1552,6 +1601,9 @@ end
 -- БРЕЙН: Smart field selection
 ------------------------------------------------------------
 local function chooseBestField(fields)
+    -- Guard: пуста таблиця полів
+    if not fields or not next(fields) then return nil, nil end
+
     if CFG.PreferredField and fields[CFG.PreferredField] then
         return CFG.PreferredField, fields[CFG.PreferredField]
     end
@@ -2001,6 +2053,7 @@ end
 -- MONDO BELLY — коли тебе зжує Mondo Chick, спам клік для виходу
 task.spawn(function()
     while task.wait(0.5) do
+        local ok = pcall(function()
         if CFG.DoMondoBelly then
             local pg = LP:FindFirstChild("PlayerGui")
             if pg then
@@ -2017,6 +2070,8 @@ task.spawn(function()
                 end
             end
         end
+        end)
+        if not ok then task.wait(2) end
     end
 end)
 
@@ -2457,8 +2512,11 @@ debugToast("Чекаю спавн персонажа...", Color3.fromRGB(80, 120
 waitForChar(15)
 char, hrp, hum = getChar()
 
-local fields     = findFields()
-local dispensers = CFG.DoDispensers and findDispensers() or {}
+-- Заповнюємо forward-declared таблиці (не створюємо нові local!)
+for k, v in pairs(findFields()) do fields[k] = v end
+if CFG.DoDispensers then
+    for _, d in ipairs(findDispensers()) do table.insert(dispensers, d) end
+end
 
 -- КРОК 1: Спочатку перевіряємо/клеймимо hive
 hive = ensureHiveClaimed()
@@ -3295,18 +3353,39 @@ LP.CharacterAdded:Connect(function()
     task.delay(120, function() FSM.deathStreak = math.max(0, FSM.deathStreak - 1) end)
 end)
 
--- ГОЛОВНИЙ FSM LOOP
+-- ГОЛОВНИЙ FSM LOOP з safety guards
 setState("FARMING", "init")
+local stuckCounter = 0
+local lastFsmState = ""
 
 while state.running do
     local ok, err = pcall(function()
         local nextS = decideNextState()
+
+        -- Anti-stuck: якщо стан не змінюється 30 ітерацій підряд (~10с) — force нести
+        if nextS == lastFsmState then
+            stuckCounter = stuckCounter + 1
+            if stuckCounter > 30 then
+                warn("[FSM] Stuck in " .. nextS .. " — forcing CLAIMING_EXTRAS")
+                nextS = "CLAIMING_EXTRAS"
+                stuckCounter = 0
+            end
+        else
+            stuckCounter = 0
+        end
+        lastFsmState = nextS
+
         setState(nextS, "decide")
         local h = handlers[nextS]
-        if h then h() end
+        if h then
+            local hOk, hErr = pcall(h)
+            if not hOk then
+                warn("[FSM] Handler " .. nextS .. " err: " .. tostring(hErr))
+            end
+        end
     end)
     if not ok then
-        warn("[FSM] Err: " .. tostring(err))
+        warn("[FSM] Decision err: " .. tostring(err))
         webhook("❌ FSM Error: " .. tostring(err):sub(1, 200), 0xFF0000)
         task.wait(3)
     end
