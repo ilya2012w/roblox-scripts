@@ -32,8 +32,34 @@ local RS           = game:GetService("ReplicatedStorage")
 local UIS          = game:GetService("UserInputService")
 local VirtualUser  = game:GetService("VirtualUser")
 local RunService   = game:GetService("RunService")
+local GuiService   = game:GetService("GuiService")
 
 local LP = Players.LocalPlayer
+
+------------------------------------------------------------
+-- ДЕТЕКТОР ПЛАТФОРМИ
+------------------------------------------------------------
+local PLATFORM = {
+    Touch    = UIS.TouchEnabled,
+    Keyboard = UIS.KeyboardEnabled,
+    Mouse    = UIS.MouseEnabled,
+    Gamepad  = UIS.GamepadEnabled,
+}
+PLATFORM.Mobile  = PLATFORM.Touch and not PLATFORM.Keyboard
+PLATFORM.Tablet  = PLATFORM.Touch and PLATFORM.Mouse  -- iPad / Surface
+PLATFORM.Desktop = PLATFORM.Keyboard and PLATFORM.Mouse and not PLATFORM.Mobile
+
+-- Розмір екрана (для адаптивного UI)
+local function getViewport()
+    local cam = Workspace.CurrentCamera
+    return cam and cam.ViewportSize or Vector2.new(1280, 720)
+end
+local VP = getViewport()
+local IS_SMALL_SCREEN = VP.X < 900 or PLATFORM.Mobile
+
+print(string.format("[BSS Macro] Platform: %s | Viewport: %dx%d",
+    PLATFORM.Mobile and "MOBILE" or PLATFORM.Tablet and "TABLET" or "DESKTOP",
+    VP.X, VP.Y))
 
 ------------------------------------------------------------
 -- DEBUG TOAST (з'являється одразу після виконання скрипта)
@@ -47,13 +73,19 @@ local function debugToast(text, color, duration)
     sg.IgnoreGuiInset = true
     sg.Parent = pg
 
+    -- Адаптивна ширина (на телефоні екран маленький)
+    local cam = Workspace.CurrentCamera
+    local screenW = cam and cam.ViewportSize.X or 1280
+    local toastW = math.min(400, screenW - 40)
+
     local lbl = Instance.new("TextLabel", sg)
-    lbl.Size = UDim2.new(0, 400, 0, 50)
-    lbl.Position = UDim2.new(0.5, -200, 0, 100)
+    lbl.Size = UDim2.new(0, toastW, 0, 50)
+    lbl.Position = UDim2.new(0.5, -toastW/2, 0, 100)
     lbl.BackgroundColor3 = color or Color3.fromRGB(60, 180, 100)
     lbl.TextColor3 = Color3.new(1, 1, 1)
     lbl.Font = Enum.Font.GothamBold
     lbl.TextSize = 14
+    lbl.TextWrapped = true
     lbl.Text = text
     lbl.ZIndex = 999
     Instance.new("UICorner", lbl).CornerRadius = UDim.new(0, 8)
@@ -219,8 +251,44 @@ local function distTo(obj)
     return (hrp.Position - p).Magnitude
 end
 
-local kp = rawget(getfenv(), "keypress") or (Input and Input.KeyPress) or function() end
-local kr = rawget(getfenv(), "keyrelease") or (Input and Input.KeyRelease) or function() end
+-- Universal input: на ПК через keypress executor'а,
+-- на мобілці — через VirtualInputManager (фейковий тач/клавіш) або ProximityPrompt
+local VIM = nil
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local kp, kr
+do
+    local _kp = rawget(getfenv(), "keypress") or (Input and Input.KeyPress)
+    local _kr = rawget(getfenv(), "keyrelease") or (Input and Input.KeyRelease)
+    if _kp and _kr then
+        kp, kr = _kp, _kr
+    elseif VIM then
+        -- VirtualInputManager доступний майже на всіх мобільних executor'ах
+        kp = function(keycode) pcall(function() VIM:SendKeyEvent(true,  keycode, false, game) end) end
+        kr = function(keycode) pcall(function() VIM:SendKeyEvent(false, keycode, false, game) end) end
+    else
+        kp = function() end
+        kr = function() end
+    end
+end
+
+-- На мобілці E-spam через клавіатуру може не працювати → fire ProximityPrompt напряму
+local function fireProximityPromptsNearby(radius)
+    radius = radius or 12
+    if not hrp then return end
+    for _, p in ipairs(Workspace:GetDescendants()) do
+        if p:IsA("ProximityPrompt") and p.Enabled then
+            local parent = p.Parent
+            local ok, pos = pcall(function()
+                if parent:IsA("BasePart") then return parent.Position end
+                return parent:GetPivot().Position
+            end)
+            if ok and (hrp.Position - pos).Magnitude <= radius then
+                pcall(function() fireproximityprompt(p) end)
+            end
+        end
+    end
+end
 local function tap(k, d)
     kp(k)
     task.wait(d or rnd(AD.ClickJitterMin, AD.ClickJitterMax))
@@ -433,7 +501,11 @@ end
 local function eSpam()
     task.spawn(function()
         while state.running do
-            if not state.paused and not state.inDanger then tap(0x45, 0.02) end
+            if not state.paused and not state.inDanger then
+                tap(0x45, 0.02)
+                -- Дублюємо через ProximityPrompt для мобілок
+                if PLATFORM.Mobile then fireProximityPromptsNearby(14) end
+            end
             task.wait(CFG.EClickInterval)
         end
     end)
@@ -675,9 +747,28 @@ local function buildGUI()
     _G.BSSMacroGuiRef = _G.BSSMacroGuiRef or {}
     _G.BSSMacroGuiRef.gui = gui
 
+    -- АДАПТИВНІ РОЗМІРИ
+    local W, H, BTN_H, TITLE_H, FONT, PAD
+    if IS_SMALL_SCREEN then
+        -- Мобільний UI: вище кнопки, більший текст, ширше
+        W       = math.min(VP.X * 0.8, 320)
+        H       = math.min(VP.Y * 0.85, 520)
+        BTN_H   = 38
+        TITLE_H = 42
+        FONT    = 14
+        PAD     = 8
+    else
+        -- Desktop
+        W, H    = 280, 430
+        BTN_H   = 28
+        TITLE_H = 32
+        FONT    = 13
+        PAD     = 6
+    end
+
     local main = Instance.new("Frame", gui)
-    main.Size = UDim2.new(0, 280, 0, 430)
-    main.Position = UDim2.new(0.5, -140, 0.5, -215)  -- по центру екрана
+    main.Size = UDim2.new(0, W, 0, H)
+    main.Position = UDim2.new(0.5, -W/2, 0.5, -H/2)
     main.ZIndex = 100
     main.BackgroundColor3 = Color3.fromRGB(25, 27, 35)
     main.BorderSizePixel = 0
@@ -688,49 +779,63 @@ local function buildGUI()
     stroke.Color = Color3.fromRGB(255, 200, 60); stroke.Thickness = 1.5
 
     local title = Instance.new("TextLabel", main)
-    title.Size = UDim2.new(1, 0, 0, 32)
+    title.Size = UDim2.new(1, 0, 0, TITLE_H)
     title.BackgroundColor3 = Color3.fromRGB(255, 200, 60)
     title.BorderSizePixel = 0
-    title.Text = "🐝  BSS Macro"
+    title.Text = PLATFORM.Mobile and "🐝 BSS Macro 📱" or "🐝  BSS Macro"
     title.Font = Enum.Font.GothamBold
-    title.TextSize = 15
+    title.TextSize = FONT + 2
     title.TextColor3 = Color3.fromRGB(25, 25, 25)
     Instance.new("UICorner", title).CornerRadius = UDim.new(0, 10)
 
+    -- Кнопка згорнути (більша на мобілці)
+    local minBtnSize = IS_SMALL_SCREEN and 36 or 28
     local minBtn = Instance.new("TextButton", title)
-    minBtn.Size = UDim2.new(0, 28, 0, 28)
-    minBtn.Position = UDim2.new(1, -32, 0, 2)
+    minBtn.Size = UDim2.new(0, minBtnSize, 0, minBtnSize)
+    minBtn.Position = UDim2.new(1, -(minBtnSize+4), 0, (TITLE_H-minBtnSize)/2)
     minBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
     minBtn.Text = "—"; minBtn.TextColor3 = Color3.new(1,1,1)
-    minBtn.Font = Enum.Font.GothamBold; minBtn.TextSize = 14
+    minBtn.Font = Enum.Font.GothamBold; minBtn.TextSize = FONT + 2
     Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
 
-    local content = Instance.new("Frame", main)
-    content.Position = UDim2.new(0, 0, 0, 32)
-    content.Size = UDim2.new(1, 0, 1, -32)
+    -- SCROLLING FRAME для контенту (важливо на маленьких екранах)
+    local content = Instance.new("ScrollingFrame", main)
+    content.Position = UDim2.new(0, 0, 0, TITLE_H)
+    content.Size = UDim2.new(1, 0, 1, -TITLE_H)
     content.BackgroundTransparency = 1
+    content.BorderSizePixel = 0
+    content.ScrollBarThickness = IS_SMALL_SCREEN and 6 or 4
+    content.ScrollBarImageColor3 = Color3.fromRGB(255, 200, 60)
+    content.CanvasSize = UDim2.new(0, 0, 0, 0)  -- авто
+    content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    content.ScrollingDirection = Enum.ScrollingDirection.Y
 
     local layout = Instance.new("UIListLayout", content)
-    layout.Padding = UDim.new(0, 6)
+    layout.Padding = UDim.new(0, PAD)
     layout.SortOrder = Enum.SortOrder.LayoutOrder
     layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
     local pad = Instance.new("UIPadding", content)
-    pad.PaddingTop = UDim.new(0, 8)
+    pad.PaddingTop = UDim.new(0, PAD)
+    pad.PaddingBottom = UDim.new(0, PAD)
 
     minBtn.MouseButton1Click:Connect(function()
         content.Visible = not content.Visible
-        main.Size = content.Visible and UDim2.new(0,280,0,430) or UDim2.new(0,280,0,32)
+        main.Size = content.Visible and UDim2.new(0,W,0,H) or UDim2.new(0,W,0,TITLE_H)
     end)
+
+    -- Зберегти параметри в замиканні для використання в makeToggle/makeButton нижче
+    _G.BSSMacroGuiRef.BTN_H = BTN_H
+    _G.BSSMacroGuiRef.FONT  = FONT
 
     local order = 0
     local function nextOrder() order = order + 1; return order end
 
     local function makeToggle(label, getVal, setVal)
         local btn = Instance.new("TextButton", content)
-        btn.Size = UDim2.new(1, -16, 0, 28)
+        btn.Size = UDim2.new(1, -16, 0, BTN_H)
         btn.LayoutOrder = nextOrder()
         btn.Font = Enum.Font.Gotham
-        btn.TextSize = 13
+        btn.TextSize = FONT
         btn.AutoButtonColor = false
         Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
         local function refresh()
@@ -739,34 +844,39 @@ local function buildGUI()
             btn.BackgroundColor3 = v and Color3.fromRGB(60, 140, 80) or Color3.fromRGB(55, 55, 65)
             btn.TextColor3 = Color3.new(1, 1, 1)
         end
-        btn.MouseButton1Click:Connect(function() setVal(not getVal()); refresh() end)
+        -- На мобілці працює і Activated, і MouseButton1Click
+        local function handler() setVal(not getVal()); refresh() end
+        btn.MouseButton1Click:Connect(handler)
+        btn.Activated:Connect(handler)
         refresh()
         return btn, refresh
     end
 
     local function makeButton(label, color, fn)
         local btn = Instance.new("TextButton", content)
-        btn.Size = UDim2.new(1, -16, 0, 28)
+        btn.Size = UDim2.new(1, -16, 0, BTN_H)
         btn.LayoutOrder = nextOrder()
         btn.BackgroundColor3 = color
         btn.TextColor3 = Color3.new(1, 1, 1)
         btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 13
+        btn.TextSize = FONT
         btn.Text = label
         Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
         btn.MouseButton1Click:Connect(fn)
+        btn.Activated:Connect(fn)
         return btn
     end
 
     local function makeLabel(text)
         local l = Instance.new("TextLabel", content)
-        l.Size = UDim2.new(1, -16, 0, 18)
+        l.Size = UDim2.new(1, -16, 0, IS_SMALL_SCREEN and 28 or 18)
         l.LayoutOrder = nextOrder()
         l.BackgroundTransparency = 1
         l.Font = Enum.Font.Gotham
-        l.TextSize = 11
+        l.TextSize = FONT - 1
         l.TextColor3 = Color3.fromRGB(180, 180, 180)
         l.TextXAlignment = Enum.TextXAlignment.Left
+        l.TextWrapped = true
         l.Text = text
         return l
     end
@@ -868,7 +978,11 @@ local function buildGUI()
         state.running = false
     end)
 
-    makeLabel("Hotkeys: K stop · P pause · H hive · B boss · M mobs · J craft")
+    if PLATFORM.Mobile then
+        makeLabel("📱 Mobile mode: тапай по кнопках. Жовте коло справа = показати/сховати меню")
+    else
+        makeLabel("Hotkeys: K stop · P pause · H hive · B boss · M mobs · J craft · RShift hide")
+    end
 
     -- Live статус
     task.spawn(function()
@@ -881,6 +995,53 @@ local function buildGUI()
                 tostring(state.inDanger), tostring(state.paused)
             )
             task.wait(1)
+        end
+    end)
+
+    ------------------------------------------------------------
+    -- FLOATING TOGGLE BUTTON (для мобілки і для зручності на ПК)
+    ------------------------------------------------------------
+    local fabSize = IS_SMALL_SCREEN and 60 or 44
+    local fab = Instance.new("TextButton", gui)
+    fab.Name = "BSSFloatingToggle"
+    fab.Size = UDim2.new(0, fabSize, 0, fabSize)
+    fab.Position = UDim2.new(1, -(fabSize + 16), 0.5, -fabSize/2)
+    fab.BackgroundColor3 = Color3.fromRGB(255, 200, 60)
+    fab.TextColor3 = Color3.fromRGB(25, 25, 25)
+    fab.Font = Enum.Font.GothamBold
+    fab.TextSize = IS_SMALL_SCREEN and 24 or 18
+    fab.Text = "🐝"
+    fab.AutoButtonColor = true
+    fab.Active = true
+    fab.Draggable = true   -- можна перетягувати на телефоні
+    fab.ZIndex = 200
+    Instance.new("UICorner", fab).CornerRadius = UDim.new(1, 0)  -- кругла
+    local fabStroke = Instance.new("UIStroke", fab)
+    fabStroke.Color = Color3.fromRGB(180, 140, 30); fabStroke.Thickness = 2
+
+    local function toggleMain()
+        main.Visible = not main.Visible
+        if main.Visible then
+            fab.Text = "✕"
+            fab.BackgroundColor3 = Color3.fromRGB(220, 80, 80)
+            fab.TextColor3 = Color3.new(1, 1, 1)
+        else
+            fab.Text = "🐝"
+            fab.BackgroundColor3 = Color3.fromRGB(255, 200, 60)
+            fab.TextColor3 = Color3.fromRGB(25, 25, 25)
+        end
+    end
+    fab.MouseButton1Click:Connect(toggleMain)
+    fab.Activated:Connect(toggleMain)
+
+    -- Pulsing анімація щоб кнопку було помітно при першому запуску
+    task.spawn(function()
+        for i = 1, 6 do
+            if not fab.Parent then return end
+            fab.Size = UDim2.new(0, fabSize + 8, 0, fabSize + 8)
+            task.wait(0.3)
+            fab.Size = UDim2.new(0, fabSize, 0, fabSize)
+            task.wait(0.3)
         end
     end)
 end
