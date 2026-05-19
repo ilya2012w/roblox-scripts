@@ -1440,6 +1440,54 @@ end
 -- AUTO-REJOIN (нова фіча)
 ------------------------------------------------------------
 local TeleportService = game:GetService("TeleportService")
+
+------------------------------------------------------------
+-- SERVER HOP (стрибок на новий сервер для свіжих токенів)
+------------------------------------------------------------
+local function serverHop()
+    debugToast("🚀 Server hop...", Color3.fromRGB(80, 120, 200), 3)
+    webhook("🚀 Server hopping", 0x00BFFF)
+
+    local req = (syn and syn.request) or http_request or request
+              or (http and http.request)
+    local placeId = game.PlaceId
+    local currentJob = game.JobId
+
+    -- Спроба 1: API публічних серверів
+    if req then
+        local cursor = ""
+        for _ = 1, 5 do
+            local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100"):format(placeId)
+            if cursor ~= "" then url = url .. "&cursor=" .. cursor end
+            local ok, response = pcall(req, { Url = url, Method = "GET" })
+            if not ok or not response or not response.Body then break end
+
+            local ok, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
+            if not ok or not data or not data.data then break end
+
+            -- Шукаємо сервер з вільним слотом
+            for _, server in ipairs(data.data) do
+                if server.id ~= currentJob
+                   and server.playing < server.maxPlayers
+                   and server.playing >= 1 then
+                    pcall(function()
+                        TeleportService:TeleportToPlaceInstance(placeId, server.id, LP)
+                    end)
+                    return true
+                end
+            end
+            cursor = data.nextPageCursor or ""
+            if cursor == "" then break end
+        end
+    end
+
+    -- Спроба 2: TeleportToPlaceInstance з порожнім jobId → випадковий
+    pcall(function() TeleportService:Teleport(placeId, LP) end)
+    return true
+end
+
+-- Тригер: коли мало токенів спавниться (поле "захоплене" іншим гравцем)
+-- або вручну з GUI
 local function setupAutoRejoin()
     if not CFG.AutoRejoin then return end
 
@@ -1993,6 +2041,12 @@ local function buildGUI()
     end))
     secAct.add(makeButton("Craft now", Color3.fromRGB(100, 120, 220), function()
         state.craftNow = true
+    end))
+    secAct.add(makeButton("🚀 Server Hop", Color3.fromRGB(80, 160, 200), function()
+        task.spawn(serverHop)
+    end))
+    secAct.add(makeButton("⟳ Rejoin same server", Color3.fromRGB(140, 100, 180), function()
+        pcall(function() TeleportService:Teleport(game.PlaceId, LP) end)
     end))
     secAct.add(makeButton("STOP", Color3.fromRGB(200, 60, 60), function()
         state.running = false
