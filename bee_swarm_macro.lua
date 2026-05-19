@@ -1632,8 +1632,26 @@ print(("[Macro] Fields=%d  Hive=%s  Dispensers=%d  UseItem=%s")
 -- GUI
 ------------------------------------------------------------
 local function buildGUI()
-    -- PlayerGui — найнадійніший варіант, його точно видно
+    -- На мобілці PlayerGui перекривається Roblox UI →
+    -- пробуємо gethui() (executor-контейнер), потім CoreGui, потім PlayerGui
     local function getGuiParent()
+        -- 1. gethui() - найкращий варіант, його не перекриває Roblox
+        local ok, hui = pcall(function() return gethui and gethui() end)
+        if ok and hui then return hui, "gethui" end
+
+        local ok2, hui2 = pcall(function() return get_hidden_gui and get_hidden_gui() end)
+        if ok2 and hui2 then return hui2, "get_hidden_gui" end
+
+        -- 2. CoreGui напряму
+        local ok3 = pcall(function()
+            local cg = game:GetService("CoreGui")
+            local test = Instance.new("Folder")
+            test.Parent = cg
+            test:Destroy()
+        end)
+        if ok3 then return game:GetService("CoreGui"), "CoreGui" end
+
+        -- 3. PlayerGui — fallback
         return LP:WaitForChild("PlayerGui"), "PlayerGui"
     end
 
@@ -1675,15 +1693,14 @@ local function buildGUI()
     -- АДАПТИВНІ РОЗМІРИ
     local W, H, BTN_H, TITLE_H, FONT, PAD
     if IS_SMALL_SCREEN then
-        -- Мобільний UI: вище кнопки, більший текст, ширше
-        W       = math.min(VP.X * 0.8, 320)
-        H       = math.min(VP.Y * 0.85, 520)
-        BTN_H   = 38
-        TITLE_H = 42
-        FONT    = 14
-        PAD     = 8
+        -- Мобільний UI: компактно щоб не перекриватись Roblox controls
+        W       = math.min(VP.X * 0.55, 280)   -- вужче (раніше було 0.8)
+        H       = math.min(VP.Y * 0.7,  420)   -- нижче
+        BTN_H   = 36
+        TITLE_H = 40
+        FONT    = 13
+        PAD     = 6
     else
-        -- Desktop
         W, H    = 280, 430
         BTN_H   = 28
         TITLE_H = 32
@@ -1693,12 +1710,17 @@ local function buildGUI()
 
     local main = Instance.new("Frame", gui)
     main.Size = UDim2.new(0, W, 0, H)
-    main.Position = UDim2.new(0.5, -W/2, 0.5, -H/2)
+    if IS_SMALL_SCREEN then
+        main.Position = UDim2.new(0, 60, 0, 50)
+    else
+        main.Position = UDim2.new(0.5, -W/2, 0.5, -H/2)
+    end
     main.ZIndex = 100
     main.BackgroundColor3 = Color3.fromRGB(25, 27, 35)
     main.BorderSizePixel = 0
     main.Active = true
-    main.Draggable = true
+    -- НЕ ставимо Draggable=true на main — перехоплює всі тачі і кнопки не реагують!
+    -- Замість цього drag робимо вручну, тільки за title (нижче).
     Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
     local stroke = Instance.new("UIStroke", main)
     stroke.Color = Color3.fromRGB(255, 200, 60); stroke.Thickness = 1.5
@@ -1712,6 +1734,34 @@ local function buildGUI()
     title.TextSize = FONT + 2
     title.TextColor3 = Color3.fromRGB(25, 25, 25)
     Instance.new("UICorner", title).CornerRadius = UDim.new(0, 10)
+
+    -- MANUAL DRAG (тільки за title, не за весь main)
+    -- Це дозволяє кнопкам всередині нормально приймати тапи
+    do
+        local dragging, dragStart, startPos = false, nil, nil
+        title.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                dragStart = input.Position
+                startPos = main.Position
+                input.Changed:Connect(function()
+                    if input.UserInputState == Enum.UserInputState.End then
+                        dragging = false
+                    end
+                end)
+            end
+        end)
+        UIS.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                          or input.UserInputType == Enum.UserInputType.Touch) then
+                local delta = input.Position - dragStart
+                main.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + delta.X,
+                    startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            end
+        end)
+    end
 
     -- Кнопка згорнути (більша на мобілці)
     local minBtnSize = IS_SMALL_SCREEN and 36 or 28
@@ -1729,11 +1779,14 @@ local function buildGUI()
     content.Size = UDim2.new(1, 0, 1, -TITLE_H)
     content.BackgroundTransparency = 1
     content.BorderSizePixel = 0
+    content.Active = true                            -- приймає touch input
+    content.ZIndex = 101
     content.ScrollBarThickness = IS_SMALL_SCREEN and 6 or 4
     content.ScrollBarImageColor3 = Color3.fromRGB(255, 200, 60)
-    content.CanvasSize = UDim2.new(0, 0, 0, 0)  -- авто
+    content.CanvasSize = UDim2.new(0, 0, 0, 0)
     content.AutomaticCanvasSize = Enum.AutomaticSize.Y
     content.ScrollingDirection = Enum.ScrollingDirection.Y
+    content.ElasticBehavior = Enum.ElasticBehavior.Always
 
     local layout = Instance.new("UIListLayout", content)
     layout.Padding = UDim.new(0, PAD)
@@ -1743,10 +1796,13 @@ local function buildGUI()
     pad.PaddingTop = UDim.new(0, PAD)
     pad.PaddingBottom = UDim.new(0, PAD)
 
-    minBtn.MouseButton1Click:Connect(function()
+    local function toggleMin()
         content.Visible = not content.Visible
         main.Size = content.Visible and UDim2.new(0,W,0,H) or UDim2.new(0,W,0,TITLE_H)
-    end)
+    end
+    minBtn.MouseButton1Click:Connect(toggleMin)
+    minBtn.Activated:Connect(toggleMin)
+    minBtn.ZIndex = 105
 
     -- Зберегти параметри в замиканні для використання в makeToggle/makeButton нижче
     _G.BSSMacroGuiRef.BTN_H = BTN_H
@@ -1762,6 +1818,8 @@ local function buildGUI()
         btn.Font = Enum.Font.Gotham
         btn.TextSize = FONT
         btn.AutoButtonColor = false
+        btn.Active = true
+        btn.ZIndex = 102
         Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
         local function refresh()
             local v = getVal()
@@ -1786,6 +1844,8 @@ local function buildGUI()
         btn.Font = Enum.Font.GothamBold
         btn.TextSize = FONT
         btn.Text = label
+        btn.Active = true
+        btn.ZIndex = 102
         Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
         btn.MouseButton1Click:Connect(fn)
         btn.Activated:Connect(fn)
@@ -1821,6 +1881,8 @@ local function buildGUI()
         header.TextColor3 = Color3.fromRGB(255, 200, 60)
         header.TextXAlignment = Enum.TextXAlignment.Left
         header.AutoButtonColor = false
+        header.Active = true
+        header.ZIndex = 103
         Instance.new("UICorner", header).CornerRadius = UDim.new(0, 6)
         local pad = Instance.new("UIPadding", header)
         pad.PaddingLeft = UDim.new(0, 10)
@@ -2097,7 +2159,7 @@ local function buildGUI()
     fab.Text = "🐝"
     fab.AutoButtonColor = true
     fab.Active = true
-    fab.Draggable = true   -- можна перетягувати на телефоні
+    -- FAB не drag — тільки tap. Інакше touch input не доходить до Click
     fab.ZIndex = 200
     Instance.new("UICorner", fab).CornerRadius = UDim.new(1, 0)  -- кругла
     local fabStroke = Instance.new("UIStroke", fab)
