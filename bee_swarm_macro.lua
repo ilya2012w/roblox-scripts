@@ -565,6 +565,89 @@ local function findEmptyHive()
     return nil
 end
 
+-- Ходьба до об'єкта з усіма захистами (pathfinding + unstuck)
+-- Використовується для важливих цілей як hive, dispenser і т.д.
+local function walkToObject(target, options)
+    options = options or {}
+    local cf = targetToCFrame(target)
+    if not cf or not hrp or not hrp.Parent then return false end
+
+    local pos = cf.Position
+    -- Якщо це Model з BoundingBox — встаємо ЗВЕРХУ на нього (для hive)
+    if options.onTop and typeof(target) == "Instance" then
+        local ok, model_cf, size = pcall(function() return target:GetBoundingBox() end)
+        if ok and size then
+            pos = model_cf.Position + Vector3.new(0, size.Y/2 + 3, 0)
+        end
+    end
+
+    -- Дуже близько вже? Просто стоїмо
+    local d = (hrp.Position - pos).Magnitude
+    if d <= 6 then return true end
+
+    setSpeed(CFG.WalkSpeed)
+
+    -- Кілька спроб ходити, з ескалацією
+    for attempt = 1, options.maxAttempts or 3 do
+        if not state.running then return false end
+
+        local reached
+        if CFG.UsePathfinding and attempt < 3 then
+            reached = walkPath(pos)
+        else
+            reached = walkToPoint(pos)
+        end
+
+        if reached then return true end
+
+        -- Не дійшли — спробуємо обходом
+        if attempt < (options.maxAttempts or 3) then
+            -- Стрибок + 2с на recover
+            if hum then hum.Jump = true end
+            task.wait(1)
+            -- Якщо взагалі застрягли — телепорт на 30 одиниць ближче і знову ходити
+            local toward = (pos - hrp.Position)
+            if toward.Magnitude > 50 then
+                local nearer = pos - toward.Unit * 30
+                hrp.CFrame = CFrame.new(nearer + Vector3.new(0, 5, 0))
+                task.wait(0.3)
+            end
+        end
+    end
+
+    -- Усі спроби провалились — тільки тут останній fallback
+    if options.teleportFallback then
+        hrp.CFrame = CFrame.new(pos)
+        task.wait(0.3)
+        return true
+    end
+    return false
+end
+
+-- Старий tpHard тепер просто wrapper (для backward compat)
+local function tpHard(target)
+    return walkToObject(target, { onTop = true, maxAttempts = 3, teleportFallback = true })
+end
+
+-- Шукає Claim ProximityPrompt біля гравця
+local function tryClaimPrompts()
+    for _, prompt in ipairs(Workspace:GetDescendants()) do
+        if prompt:IsA("ProximityPrompt") and prompt.Enabled then
+            local parent = prompt.Parent
+            local ok, pos = pcall(function()
+                if parent:IsA("BasePart") then return parent.Position end
+                return parent:GetPivot().Position
+            end)
+            if ok and (hrp.Position - pos).Magnitude < 25 then
+                local txt = (prompt.ActionText or "") .. " " .. (prompt.ObjectText or "")
+                if txt:lower():find("claim") or txt:lower():find("hive") then
+                    pcall(function() fireproximityprompt(prompt) end)
+                end
+            end
+        end
+    end
+end
+
 -- Перевіряє чи реально на вулику стоїмо (для claim)
 local function ensureHiveClaimed()
     local mine = findMyHive()
@@ -583,15 +666,43 @@ local function ensureHiveClaimed()
         return nil
     end
 
-    -- Йдемо до вільного
-    tpTo(empty); task.wait(1)
-    -- Стоїмо на ньому і спамимо E + ProximityPrompt
-    for _ = 1, 8 do
+    -- ХОДИМО до hive (з pathfinding + unstuck), TP лише як останній fallback
+    debugToast("Йду до вулика...", Color3.fromRGB(80, 120, 200), 2)
+    local reached = walkToObject(empty, {
+        onTop = true,
+        maxAttempts = 4,
+        teleportFallback = true,  -- якщо геть не може дійти за 4 спроби
+    })
+
+    if not reached then
+        debugToast("⚠ Не зміг дійти до hive", Color3.fromRGB(220, 80, 80), 4)
+        return nil
+    end
+
+    task.wait(0.5)
+
+    -- Спам усіх способів claim'у
+    for attempt = 1, 15 do
+        if not state.running then break end
         tap(0x45, 0.05)
-        fireProximityPromptsNearby(20)
-        task.wait(0.3)
+        tryClaimPrompts()
+        fireProximityPromptsNearby(25)
+
+        for _, cd in ipairs(empty:GetDescendants()) do
+            if cd:IsA("ClickDetector") then
+                pcall(function() fireclickdetector(cd) end)
+            end
+        end
+
         mine = findMyHive()
         if mine then break end
+
+        -- Якщо випали з hive — підходимо знову (walk, не tp)
+        local hivePos = empty:GetPivot().Position
+        if (hrp.Position - hivePos).Magnitude > 15 then
+            walkToObject(empty, { onTop = true, maxAttempts = 1, teleportFallback = false })
+        end
+        task.wait(0.3)
     end
 
     if mine then
@@ -599,8 +710,8 @@ local function ensureHiveClaimed()
         webhook("🏠 Claimed hive: " .. mine.Name, 0x66FF66)
         return mine
     else
-        debugToast("⚠ Не вдалося claim hive автоматично — claim вручну", Color3.fromRGB(220, 140, 50), 5)
-        return empty  -- повертаємо просто як reference
+        debugToast("⚠ Не вдалося claim автоматично — натисни E на hive", Color3.fromRGB(220, 140, 50), 5)
+        return empty
     end
 end
 
@@ -1596,9 +1707,21 @@ end
 
 local function convertAtHive()
     if not hive then return end
-    tpTo(hive); task.wait(0.6)
-    for _ = 1, 10 do tap(0x45, 0.05); task.wait(0.25) end
-    task.wait(1)
+    -- ХОДИМО до hive (walk, не tp)
+    walkToObject(hive, { onTop = true, maxAttempts = 3, teleportFallback = true })
+    task.wait(0.5)
+    -- Перевірка дистанції
+    local hivePos = hive:GetPivot().Position
+    if (hrp.Position - hivePos).Magnitude > 20 then
+        walkToObject(hive, { onTop = true, maxAttempts = 2, teleportFallback = true })
+    end
+    -- Конвертація: спам E + ProximityPrompt
+    for _ = 1, 12 do
+        tap(0x45, 0.05)
+        fireProximityPromptsNearby(20)
+        task.wait(0.25)
+    end
+    task.wait(0.5)
 end
 
 local function visitDispensers(disp)
@@ -2438,9 +2561,7 @@ local function buildGUI()
     main.ZIndex = 100
     main.BackgroundColor3 = Color3.fromRGB(25, 27, 35)
     main.BorderSizePixel = 0
-    main.Active = true
-    -- НЕ ставимо Draggable=true на main — перехоплює всі тачі і кнопки не реагують!
-    -- Замість цього drag робимо вручну, тільки за title (нижче).
+    -- НЕ Active, НЕ Draggable — не перехоплюємо тачі. Кнопки самі реагують.
     Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
     local stroke = Instance.new("UIStroke", main)
     stroke.Color = Color3.fromRGB(255, 200, 60); stroke.Thickness = 1.5
@@ -2455,30 +2576,42 @@ local function buildGUI()
     title.TextColor3 = Color3.fromRGB(25, 25, 25)
     Instance.new("UICorner", title).CornerRadius = UDim.new(0, 10)
 
-    -- MANUAL DRAG (тільки за title, не за весь main)
-    -- Це дозволяє кнопкам всередині нормально приймати тапи
+    -- MANUAL DRAG за title — спрацьовує лише якщо реально рух пальцем > 5px
+    -- Звичайний tap по title не активує drag → minBtn (всередині title) спрацьовує нормально
     do
-        local dragging, dragStart, startPos = false, nil, nil
+        local pressing = false
+        local pressPos = nil
+        local pressStartPos = nil
+        local dragging = false
+        title.Active = true
         title.InputBegan:Connect(function(input)
             if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = true
-                dragStart = input.Position
-                startPos = main.Position
-                input.Changed:Connect(function()
-                    if input.UserInputState == Enum.UserInputState.End then
-                        dragging = false
-                    end
-                end)
+                pressing = true
+                dragging = false
+                pressPos = input.Position
+                pressStartPos = main.Position
+            end
+        end)
+        title.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+                pressing = false
+                dragging = false
             end
         end)
         UIS.InputChanged:Connect(function(input)
-            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-                          or input.UserInputType == Enum.UserInputType.Touch) then
-                local delta = input.Position - dragStart
-                main.Position = UDim2.new(
-                    startPos.X.Scale, startPos.X.Offset + delta.X,
-                    startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            if not pressing then return end
+            if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+                local delta = input.Position - pressPos
+                -- Активуємо drag лише після відчутного руху
+                if not dragging and delta.Magnitude > 5 then dragging = true end
+                if dragging then
+                    main.Position = UDim2.new(
+                        pressStartPos.X.Scale, pressStartPos.X.Offset + delta.X,
+                        pressStartPos.Y.Scale, pressStartPos.Y.Offset + delta.Y)
+                end
             end
         end)
     end
