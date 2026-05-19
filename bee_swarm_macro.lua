@@ -1843,15 +1843,16 @@ local function buildGUI()
 
         return {
             add = function(element)
+                if not element then return end  -- захист від nil
                 table.insert(items, element)
-                element.Visible = sec.expanded
+                pcall(function() element.Visible = sec.expanded end)
             end
         }
     end
 
     local function makeDropdown(label, options, getVal, setVal)
         local box = Instance.new("Frame", content)
-        box.Size = UDim2.new(1, -16, 0, 28)
+        box.Size = UDim2.new(1, -16, 0, BTN_H)
         box.LayoutOrder = nextOrder()
         box.BackgroundColor3 = Color3.fromRGB(55, 55, 65)
         Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
@@ -1860,44 +1861,51 @@ local function buildGUI()
         btn.Size = UDim2.new(1, 0, 1, 0)
         btn.BackgroundTransparency = 1
         btn.Font = Enum.Font.Gotham
-        btn.TextSize = 12
+        btn.TextSize = FONT
         btn.TextColor3 = Color3.new(1, 1, 1)
         btn.Text = label .. ": " .. tostring(getVal() or "—")
 
+        local itemH = IS_SMALL_SCREEN and 32 or 24
         local listFrame = Instance.new("ScrollingFrame", main)
-        listFrame.Size = UDim2.new(0, 240, 0, math.min(#options * 26 + 6, 180))
+        listFrame.Size = UDim2.new(0, math.min(W - 40, 240), 0, math.min(#options * (itemH + 2) + 6, 200))
         listFrame.BackgroundColor3 = Color3.fromRGB(35, 37, 45)
         listFrame.BorderSizePixel = 0
         listFrame.Visible = false
-        listFrame.ZIndex = 5
-        listFrame.CanvasSize = UDim2.new(0, 0, 0, #options * 26 + 6)
-        listFrame.ScrollBarThickness = 4
+        listFrame.ZIndex = 50
+        listFrame.CanvasSize = UDim2.new(0, 0, 0, #options * (itemH + 2) + 6)
+        listFrame.ScrollBarThickness = IS_SMALL_SCREEN and 6 or 4
         Instance.new("UICorner", listFrame).CornerRadius = UDim.new(0, 6)
         local ll = Instance.new("UIListLayout", listFrame)
         ll.Padding = UDim.new(0, 2)
 
         for _, opt in ipairs(options) do
             local b = Instance.new("TextButton", listFrame)
-            b.Size = UDim2.new(1, -8, 0, 24)
+            b.Size = UDim2.new(1, -8, 0, itemH)
             b.BackgroundColor3 = Color3.fromRGB(55, 55, 65)
             b.TextColor3 = Color3.new(1, 1, 1)
             b.Font = Enum.Font.Gotham
-            b.TextSize = 12
+            b.TextSize = FONT
             b.Text = tostring(opt)
-            b.ZIndex = 6
+            b.ZIndex = 51
             Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
-            b.MouseButton1Click:Connect(function()
+            local function selectOpt()
                 setVal(opt)
                 btn.Text = label .. ": " .. tostring(opt)
                 listFrame.Visible = false
-            end)
+            end
+            b.MouseButton1Click:Connect(selectOpt)
+            b.Activated:Connect(selectOpt)
         end
 
-        btn.MouseButton1Click:Connect(function()
+        local function toggleList()
             local p = box.AbsolutePosition - main.AbsolutePosition
-            listFrame.Position = UDim2.new(0, p.X, 0, p.Y + 30)
+            listFrame.Position = UDim2.new(0, p.X, 0, p.Y + BTN_H + 4)
             listFrame.Visible = not listFrame.Visible
-        end)
+        end
+        btn.MouseButton1Click:Connect(toggleList)
+        btn.Activated:Connect(toggleList)
+
+        return box  -- ← КРИТИЧНО: повертаємо елемент для makeSection.add()
     end
 
     -- Статус
