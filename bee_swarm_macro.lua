@@ -135,10 +135,11 @@ local CFG = {
 
     -- Рух (Atlas-style):
     UseWalking       = true,
-    UsePathfinding   = false,
-    WalkAcceptRadius = 4,
-    WalkTimeout      = 8,
+    UsePathfinding   = true,            -- ввімкнено за замовч — обходить декор
+    WalkAcceptRadius = 5,
+    WalkTimeout      = 6,
     TeleportFallback = true,
+    UnstuckTime      = 2,                -- якщо не рухається 2с — unstuck
 
     -- Atlas-style фічі:
     DoBeequips       = true,            -- авто-екіпірування beequip
@@ -356,17 +357,52 @@ local function tpRaw(target)
     return true
 end
 
--- Реальний рух humanoid'ом (Atlas-style)
+-- Реальний рух humanoid'ом з unstuck-логікою
 local function walkToPoint(pos)
     if not hum or not hrp then return false end
     local t0 = tick()
+    local lastPos = hrp.Position
+    local stuckSince = tick()
+    local jumpAttempts = 0
+
     hum:MoveTo(pos)
+
     while tick() - t0 < CFG.WalkTimeout do
         if not state.running then return false end
-        local d = (hrp.Position - pos).Magnitude
+        local cur = hrp.Position
+        local d = (cur - pos).Magnitude
         if d <= CFG.WalkAcceptRadius then return true end
-        -- Якщо застряг — нагадуємо ціль
-        if (tick() - t0) % 1 < 0.05 then hum:MoveTo(pos) end
+
+        -- UNSTUCK: чи рухаємось взагалі?
+        local moved = (cur - lastPos).Magnitude
+        if moved < 0.5 then
+            if tick() - stuckSince > CFG.UnstuckTime then
+                jumpAttempts = jumpAttempts + 1
+                if jumpAttempts <= 2 then
+                    -- Спроба 1-2: стрибок
+                    hum.Jump = true
+                    task.wait(0.3)
+                    hum:MoveTo(pos)
+                    stuckSince = tick()
+                else
+                    -- Спроба 3+: телепорт на 5 одиниць вгору і вперед
+                    local dir = (pos - cur)
+                    if dir.Magnitude > 0 then dir = dir.Unit else dir = Vector3.new(0,0,1) end
+                    hrp.CFrame = CFrame.new(cur + Vector3.new(0, 5, 0) + dir * 3)
+                    task.wait(0.2)
+                    hum:MoveTo(pos)
+                    stuckSince = tick()
+                    if jumpAttempts > 5 then return false end  -- здаємось
+                end
+            end
+        else
+            stuckSince = tick()
+            jumpAttempts = 0
+        end
+        lastPos = cur
+
+        -- Нагадуємо ціль кожну секунду
+        if (tick() - t0) % 1 < 0.1 then hum:MoveTo(pos) end
         task.wait(0.1)
     end
     return false
@@ -505,15 +541,71 @@ local function findFields()
     return out
 end
 
-local function findHive()
+-- Шукає вже claim-нутий мій вулик
+local function findMyHive()
     local hives = Workspace:FindFirstChild("Hives") or Workspace:FindFirstChild("Honeycombs")
     if not hives then return nil end
     for _, h in ipairs(hives:GetChildren()) do
         local owner = h:FindFirstChild("Owner")
         if (owner and owner.Value == LP) or h.Name == LP.Name then return h end
     end
-    return hives:GetChildren()[1]
+    return nil
 end
+
+-- Шукає вільний вулик щоб claim'нути
+local function findEmptyHive()
+    local hives = Workspace:FindFirstChild("Hives") or Workspace:FindFirstChild("Honeycombs")
+    if not hives then return nil end
+    for _, h in ipairs(hives:GetChildren()) do
+        local owner = h:FindFirstChild("Owner")
+        if owner and (owner.Value == nil or owner.Value == "") then
+            return h
+        end
+    end
+    return nil
+end
+
+-- Перевіряє чи реально на вулику стоїмо (для claim)
+local function ensureHiveClaimed()
+    local mine = findMyHive()
+    if mine then
+        print("[Macro] Hive вже claim-нутий: " .. mine.Name)
+        return mine
+    end
+
+    print("[Macro] Hive не claim-нутий — шукаю вільний")
+    debugToast("Шукаю вільний hive...", Color3.fromRGB(80, 120, 200), 3)
+
+    local empty = findEmptyHive()
+    if not empty then
+        debugToast("❌ Нема вільних hive!", Color3.fromRGB(220, 60, 60), 4)
+        warn("[Macro] Усі hive зайняті — макрос не зможе фармити")
+        return nil
+    end
+
+    -- Йдемо до вільного
+    tpTo(empty); task.wait(1)
+    -- Стоїмо на ньому і спамимо E + ProximityPrompt
+    for _ = 1, 8 do
+        tap(0x45, 0.05)
+        fireProximityPromptsNearby(20)
+        task.wait(0.3)
+        mine = findMyHive()
+        if mine then break end
+    end
+
+    if mine then
+        debugToast("✓ Hive claimed: " .. mine.Name, Color3.fromRGB(60, 180, 100), 3)
+        webhook("🏠 Claimed hive: " .. mine.Name, 0x66FF66)
+        return mine
+    else
+        debugToast("⚠ Не вдалося claim hive автоматично — claim вручну", Color3.fromRGB(220, 140, 50), 5)
+        return empty  -- повертаємо просто як reference
+    end
+end
+
+-- Стара назва для backward compat
+local function findHive() return findMyHive() end
 
 local function findDispensers()
     local out = {}
@@ -888,16 +980,617 @@ local function collectTokens()
     end
 end
 
-local function farmField(fm)
+------------------------------------------------------------
+-- 🧠 BRAIN: Token Heatmap — пам'ятає де токени спавняться частіше
+------------------------------------------------------------
+local heatmap = {}  -- { [fieldName] = { [gridKey] = count } }
+local HEATMAP_GRID = 30  -- розмір клітинки в одиницях
+
+local function heatKey(pos)
+    return math.floor(pos.X / HEATMAP_GRID) .. ":" .. math.floor(pos.Z / HEATMAP_GRID)
+end
+
+local function recordTokenSpawn(fieldName, pos)
+    if not heatmap[fieldName] then heatmap[fieldName] = {} end
+    local k = heatKey(pos)
+    heatmap[fieldName][k] = (heatmap[fieldName][k] or 0) + 1
+end
+
+-- Найгарячіша точка на полі
+local function hottestSpot(fieldName)
+    if not heatmap[fieldName] then return nil end
+    local bestKey, bestCount = nil, 0
+    for k, c in pairs(heatmap[fieldName]) do
+        if c > bestCount then bestCount = c; bestKey = k end
+    end
+    if not bestKey then return nil end
+    local gx, gz = bestKey:match("(-?%d+):(-?%d+)")
+    return Vector3.new(tonumber(gx) * HEATMAP_GRID + HEATMAP_GRID/2,
+                       hrp.Position.Y,
+                       tonumber(gz) * HEATMAP_GRID + HEATMAP_GRID/2)
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: Bee Reader — читає твоїх бджіл
+------------------------------------------------------------
+local beeComposition = { types = {}, count = 0, pollenAffinity = {}, mythics = 0, legendaries = 0 }
+
+local function readBeeComposition()
+    beeComposition = { types = {}, count = 0, pollenAffinity = {}, mythics = 0, legendaries = 0 }
+    -- Бджоли зберігаються в Workspace.Bees або як part of hive
+    local hives = Workspace:FindFirstChild("Hives") or Workspace:FindFirstChild("Honeycombs")
+    if not hives or not hive then return end
+
+    for _, b in ipairs(hive:GetDescendants()) do
+        if b:IsA("Model") and b:GetAttribute("Type") then
+            local bType = b:GetAttribute("Type")
+            beeComposition.types[bType] = (beeComposition.types[bType] or 0) + 1
+            beeComposition.count = beeComposition.count + 1
+            local rarity = b:GetAttribute("Rarity") or ""
+            if rarity == "Mythic" then beeComposition.mythics = beeComposition.mythics + 1 end
+            if rarity == "Legendary" then beeComposition.legendaries = beeComposition.legendaries + 1 end
+        end
+    end
+    -- Pollen affinity: припускаємо що Brave/Demo/Tabby/Music/Frosty люблять red, тощо
+    -- (спрощено)
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: Quest Parser — читає поточний quest
+------------------------------------------------------------
+local currentQuest = { text = "", giver = "", objective = nil }
+
+local function parseCurrentQuest()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("TextLabel") then
+            local t = d.Text or ""
+            -- Шукаємо текст виду "Bring X pollen" / "Collect X token" / "Defeat X"
+            local poll = t:match("(%d[%d,]*)%s*Pollen")
+            local tok  = t:match("Collect%s+(%d+)%s*([%w%s]+)")
+            local def  = t:match("Defeat%s+([%w%s]+)")
+            if poll or tok or def then
+                currentQuest.text = t
+                if poll then currentQuest.objective = { type = "pollen", amount = tonumber((poll:gsub(",", ""))) } end
+                if tok  then currentQuest.objective = { type = "token", name = tok, amount = tonumber(t:match("(%d+)")) } end
+                if def  then currentQuest.objective = { type = "kill", target = def } end
+                return
+            end
+        end
+    end
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: Bag Predictor — ETA до повного мішка
+------------------------------------------------------------
+local bagHistory = {}  -- { {time, fill}, ... }
+
+local function recordBagSample()
+    local f = readBagFill() or 0
+    table.insert(bagHistory, { tick(), f })
+    if #bagHistory > 60 then table.remove(bagHistory, 1) end
+end
+
+-- Скільки секунд лишилось до повного мішка (приблизно)
+local function bagETA()
+    if #bagHistory < 5 then return math.huge end
+    local last = bagHistory[#bagHistory]
+    local first = bagHistory[1]
+    local dt = last[1] - first[1]
+    local df = last[2] - first[2]
+    if dt < 10 or df <= 0 then return math.huge end
+    local rate = df / dt  -- fill per second
+    local remaining = (CFG.BagFullThreshold - last[2]) / rate
+    return math.max(0, remaining)
+end
+
+-- Фоновий sampler
+task.spawn(function()
+    while task.wait(5) do
+        if state.running then pcall(recordBagSample) end
+    end
+end)
+
+------------------------------------------------------------
+-- 🧠 BRAIN: Risk Assessor — оцінка небезпеки локації
+------------------------------------------------------------
+local function assessRisk()
+    -- 0 = безпечно, 100 = смерть скоро
+    local risk = 0
+    local killers = findKillersNearby()
+    risk = risk + #killers * 30
+
+    -- HP перевірка
+    if hum and hum.MaxHealth > 0 then
+        local hpPercent = hum.Health / hum.MaxHealth
+        if hpPercent < 0.3 then risk = risk + 40
+        elseif hpPercent < 0.6 then risk = risk + 15 end
+    end
+
+    -- На небезпечних полях (Mountain Top, Coconut, Pepper) дефолтно вищий ризик
+    local curField = findCurrentField(fields)
+    if curField then
+        local n = curField:lower()
+        if n:find("mountain") or n:find("coconut") or n:find("pepper")
+           or n:find("cactus") or n:find("rose") then
+            risk = risk + 10
+        end
+    end
+
+    return math.min(100, risk)
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: Field Depletion Detector
+------------------------------------------------------------
+local fieldDepletion = {}  -- { [fieldName] = { lastSpawnTime, recentSpawns } }
+
+local function recordFieldActivity(fieldName, tokensFound)
+    if not fieldDepletion[fieldName] then
+        fieldDepletion[fieldName] = { lastSpawnTime = tick(), recentSpawns = {} }
+    end
+    local fd = fieldDepletion[fieldName]
+    if tokensFound > 0 then
+        fd.lastSpawnTime = tick()
+        table.insert(fd.recentSpawns, { tick(), tokensFound })
+        if #fd.recentSpawns > 20 then table.remove(fd.recentSpawns, 1) end
+    end
+end
+
+local function isFieldDepleted(fieldName)
+    local fd = fieldDepletion[fieldName]
+    if not fd then return false end
+    -- Якщо за останні 30с не було жодного нового токена — поле "вижате"
+    return (tick() - fd.lastSpawnTime) > 30
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: Smart Token Combos
+-- Якщо бачимо Token Link + інші токени поряд — спочатку Link потім інші
+------------------------------------------------------------
+local function detectTokenCombo()
+    local toks = findTokens(150)
+    if #toks < 3 then return nil end
+    local hasLink, hasStorm = false, false
+    for _, t in ipairs(toks) do
+        if t.kind == "Token Link" then hasLink = true end
+        if t.kind == "Token Storm" then hasStorm = true end
+    end
+    if hasLink or hasStorm then return "combo" end
+    return nil
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: Adaptive Farm Time
+------------------------------------------------------------
+local function adaptiveFarmTime()
+    local eta = bagETA()
+    if eta == math.huge then return 180 end
+    return math.max(30, math.min(300, eta + 10))
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: COST-BENEFIT ANALYZER
+-- Кожна дія має cost (час, ризик) і benefit (нагорода).
+-- Бот вибирає максимальне benefit / cost.
+------------------------------------------------------------
+local actionEV = {}  -- exponential moving average of expected value
+
+local function evaluateAction(name, expectedReward, expectedTimeCost, risk)
+    risk = risk or 0
+    local rawEV = expectedReward / math.max(1, expectedTimeCost) * (1 - risk / 100)
+    -- EMA з alpha = 0.3 (адаптивне навчання)
+    actionEV[name] = (actionEV[name] or rawEV) * 0.7 + rawEV * 0.3
+    return actionEV[name]
+end
+
+-- Записати реальний outcome дії (для навчання)
+local function recordOutcome(actionName, actualReward, actualTime)
+    if not actionEV[actionName] then actionEV[actionName] = 0 end
+    local actualEV = actualReward / math.max(1, actualTime)
+    actionEV[actionName] = actionEV[actionName] * 0.8 + actualEV * 0.2
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: GOAL QUEUE — список цілей з пріоритетами
+------------------------------------------------------------
+local goals = {}  -- { {id, type, priority, expires, data}, ... }
+
+local function addGoal(id, gType, priority, ttl, data)
+    -- Не дублюємо
+    for _, g in ipairs(goals) do
+        if g.id == id then return end
+    end
+    table.insert(goals, {
+        id = id, type = gType,
+        priority = priority,
+        expires = ttl and (tick() + ttl) or math.huge,
+        data = data or {}
+    })
+end
+
+local function removeGoal(id)
+    for i = #goals, 1, -1 do
+        if goals[i].id == id then table.remove(goals, i); return true end
+    end
+    return false
+end
+
+local function pruneGoals()
+    local now = tick()
+    for i = #goals, 1, -1 do
+        if goals[i].expires < now then table.remove(goals, i) end
+    end
+end
+
+local function topGoal()
+    pruneGoals()
+    table.sort(goals, function(a, b) return a.priority > b.priority end)
+    return goals[1]
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: PLANNER — багатокроковий план
+------------------------------------------------------------
+local currentPlan = {}  -- черга наступних дій
+
+local function planAhead()
+    currentPlan = {}
+    local bagFill = readBagFill() or 0
+    local eta = bagETA()
+    local risk = assessRisk()
+
+    -- Якщо мішок майже повний → конверт → потім фарм
+    if bagFill > 0.85 then
+        table.insert(currentPlan, "CONVERTING")
+        table.insert(currentPlan, "FARMING")
+        return
+    end
+
+    -- Якщо є event-токени поряд (Storm/Token Link) → пріоритет
+    if detectTokenCombo() then
+        table.insert(currentPlan, "FARMING")  -- бо там же
+        return
+    end
+
+    -- Якщо storm активний → фарм поки не закінчиться
+    if state.stormActive then
+        table.insert(currentPlan, "FARMING")
+        table.insert(currentPlan, "CONVERTING")
+        return
+    end
+
+    -- Низький мішок + великі ETA → можна зробити боса між
+    if state.bossMode and bagFill < 0.4 and tick() - FSM.lastBoss > 900 then
+        table.insert(currentPlan, "BOSS")
+    end
+
+    -- Раз на 10 хв claim extras
+    if tick() - FSM.lastClaims > 600 then
+        table.insert(currentPlan, "CLAIMING_EXTRAS")
+    end
+
+    -- Default
+    table.insert(currentPlan, "FARMING")
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: SMART FLEEING — тікаємо в напрямку ВІД killer'а
+------------------------------------------------------------
+local function smartFlee()
+    local killers = findKillersNearby()
+    if #killers == 0 then
+        if hive then tpTo(hive) end
+        return
+    end
+
+    -- Усереднена позиція killer'ів
+    local avgKiller = Vector3.new(0, 0, 0)
+    for _, k in ipairs(killers) do
+        local ok, p = pcall(function() return k:GetPivot().Position end)
+        if ok then avgKiller = avgKiller + p end
+    end
+    avgKiller = avgKiller / #killers
+
+    -- Напрямок ВІД killer'ів до hive
+    local fleeDir = (hrp.Position - avgKiller).Unit
+    local fleeTarget = hrp.Position + fleeDir * 200
+
+    -- Спочатку рух у напрямку від killer'а
+    tpRaw(fleeTarget)
+    task.wait(0.3)
+    -- Потім на hive
+    if hive then tpTo(hive); task.wait(5) end
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: COMBO ORCHESTRATOR
+-- Синхронізує дорогі баффи + storm + Token Link для максимуму
+------------------------------------------------------------
+local function attemptMegaCombo()
+    -- Умови: storm активний, мішок майже пустий, є дорогі items
+    if not state.stormActive then return false end
+    if (readBagFill() or 0) > 0.3 then return false end
+
+    print("[Brain] MEGA COMBO: storm + buffs + farm")
+    webhook("⚡ MEGA COMBO activated", 0xFF00FF)
+
+    -- 1) Активуємо всі buffs
+    useBuffs()
+    activateHaste()
+    pcall(function() useItemByName("Glitter") end)
+    pcall(function() useItemByName("Oil") end)
+    pcall(function() useItemByName("Enzymes") end)
+    pcall(function() useItemByName("Glue") end)
+
+    -- 2) Біжимо на найкраще storm-поле
+    local _, fm = chooseBestField(fields)
+    if fm then farmField(fm) end
+    return true
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: HP RECOVERY
+------------------------------------------------------------
+local function needsHpRecovery()
+    if not hum or hum.MaxHealth <= 0 then return false end
+    return (hum.Health / hum.MaxHealth) < 0.3
+end
+
+local function recoverHP()
+    if not hum then return end
+    print("[Brain] HP low → recover")
+    if hive then tpTo(hive) end
+    local t0 = tick()
+    while hum.Health < hum.MaxHealth * 0.95 and tick() - t0 < 30 do
+        task.wait(0.5)
+    end
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: PREDICTIVE TOKEN SPAWN
+-- На основі heatmap передбачає де токен з'явиться раніше всіх
+------------------------------------------------------------
+local function predictNextTokenLocation(fieldName)
+    local h = heatmap[fieldName]
+    if not h then return nil end
+    -- Точки відсортовані за частотою + recency
+    local sorted = {}
+    for k, c in pairs(h) do
+        table.insert(sorted, { key = k, count = c })
+    end
+    table.sort(sorted, function(a, b) return a.count > b.count end)
+    if #sorted == 0 then return nil end
+    -- Беремо top-3 і повертаємо ту куди ми ще не йшли
+    for i = 1, math.min(3, #sorted) do
+        local gx, gz = sorted[i].key:match("(-?%d+):(-?%d+)")
+        if gx then
+            return Vector3.new(
+                tonumber(gx) * HEATMAP_GRID + HEATMAP_GRID/2,
+                hrp.Position.Y,
+                tonumber(gz) * HEATMAP_GRID + HEATMAP_GRID/2)
+        end
+    end
+    return nil
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: EVENT DETECTOR (Honey Day, Bee Day, etc)
+------------------------------------------------------------
+local currentEvent = nil
+
+local function detectEvents()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Text then
+            local t = d.Text:lower()
+            if t:find("honey day") then currentEvent = "honey_day"; return end
+            if t:find("bee day") then currentEvent = "bee_day"; return end
+            if t:find("tunnel bear day") then currentEvent = "tunnel_day"; return end
+            if t:find("beesmas") then currentEvent = "beesmas"; return end
+            if t:find("ant invasion") then currentEvent = "ant_invasion"; return end
+        end
+    end
+    currentEvent = nil
+end
+
+------------------------------------------------------------
+-- 🧠 BRAIN: PATIENT IDLE — щось корисне коли нема дій
+------------------------------------------------------------
+local function patientIdle()
+    -- Раз на 3 сек перевіряємо чи з'явилось щось цінне поряд
+    local nearby = findTokens(400)
+    if #nearby > 0 then
+        collectTokens()
+        return
+    end
+    -- Йдемо до прогнозованої точки спавну
+    local curField = findCurrentField(fields)
+    if curField then
+        local pred = predictNextTokenLocation(curField)
+        if pred and (hrp.Position - pred).Magnitude > 30 then
+            walkToPoint(pred)
+            return
+        end
+    end
+    task.wait(2)
+end
+
+------------------------------------------------------------
+-- BRAIN: Yield tracker (пам'ять про прибутковість полів)
+------------------------------------------------------------
+local fieldStats = {}  -- { [fieldName] = { bagGained=N, timeSpent=N, lastVisit=T, killerCount=N } }
+
+local function getFieldStat(name)
+    if not fieldStats[name] then
+        fieldStats[name] = { bagGained = 0, timeSpent = 0, lastVisit = 0, killerCount = 0, visits = 0 }
+    end
+    return fieldStats[name]
+end
+
+-- Rate = скільки заробляєш на секунду на цьому полі (емпірично)
+local function fieldYieldRate(name)
+    local s = getFieldStat(name)
+    if s.timeSpent < 5 then return 0.5 end  -- невідомо, припускаємо середньо
+    return s.bagGained / s.timeSpent
+end
+
+------------------------------------------------------------
+-- БРЕЙН: Smart field selection
+------------------------------------------------------------
+local function chooseBestField(fields)
+    if CFG.PreferredField and fields[CFG.PreferredField] then
+        return CFG.PreferredField, fields[CFG.PreferredField]
+    end
+
+    -- Storm активний — на Mountain Top (найбільший boost від storm)
+    if state.stormActive then
+        for n, m in pairs(fields) do
+            if n:lower():find("mountain") then return n, m end
+        end
+    end
+
+    -- Quest active: якщо є quest на pollen у X-полі — йдемо туди
+    if currentQuest.objective and currentQuest.objective.type == "pollen" then
+        for n, m in pairs(fields) do
+            if currentQuest.text:lower():find(n:lower()) then
+                return n, m
+            end
+        end
+    end
+
+    -- Низький HP / висока небезпека — йдемо на safe поле
+    if assessRisk() > 50 then
+        local safe = { "Sunflower", "Dandelion", "Mushroom", "Blue Flower", "Clover" }
+        for _, sn in ipairs(safe) do
+            for n, m in pairs(fields) do
+                if n:lower():find(sn:lower()) then return n, m end
+            end
+        end
+    end
+
+    -- Скорінг полів з усіма факторами
+    local best, bestScore = nil, -math.huge
+    for n, m in pairs(fields) do
+        local s = getFieldStat(n)
+        local rate = fieldYieldRate(n)
+        local killerPenalty = (tick() - s.lastVisit < 60 and s.killerCount > 0) and -0.5 or 0
+        local recencyBonus = (tick() - s.lastVisit > 600) and 0.15 or 0
+        local depletionPenalty = isFieldDepleted(n) and -0.4 or 0
+        local exploreBonus = s.visits == 0 and 0.35 or 0
+
+        local score = rate + killerPenalty + recencyBonus + depletionPenalty + exploreBonus
+
+        -- Bonus за rare bees: якщо у тебе багато mythics, краще rose/pepper/mountain
+        if beeComposition.mythics > 5 then
+            local hardN = n:lower()
+            if hardN:find("rose") or hardN:find("pepper") or hardN:find("mountain")
+               or hardN:find("cactus") then
+                score = score + 0.2
+            end
+        end
+
+        if score > bestScore then bestScore = score; best = n end
+    end
+    return best, best and fields[best] or nil
+end
+
+------------------------------------------------------------
+-- FARM FIELD з yield-tracking + камп токенів
+------------------------------------------------------------
+local function farmField(fm, fieldName)
     if not fm then return end
+    fieldName = fieldName or fm.Name
+    local stat = getFieldStat(fieldName)
+    stat.visits = stat.visits + 1
+    stat.lastVisit = tick()
+
     tpTo(fm); task.wait(0.4)
     setSpeed(CFG.WalkSpeed)
-    local farmEnd = tick() + 240
+
+    -- Адаптивний час фарму на основі швидкості наповнення мішка
+    local farmDuration = adaptiveFarmTime()
+    local farmStart = tick()
+    local farmEnd = tick() + farmDuration
+    local startBag = readBagFill() or 0
+    local startKillers = #findKillersNearby()
+    stat.killerCount = startKillers
+
+    -- Якщо heatmap має гарячу точку — телепорт туди для камп'у
+    local hotspot = hottestSpot(fieldName)
+    if hotspot then
+        tpRaw(hotspot)
+        task.wait(0.3)
+    end
+
+    local lastTokenCount = 0
+    local depletedChecks = 0
+
     while state.running and not state.returnNow and not state.inDanger and tick() < farmEnd do
-        snakeMove(7)
+        -- 1) Перевіряємо combo (Token Link + інші) — терміновий збір
+        if detectTokenCombo() then
+            collectTokens()
+        end
+
+        -- 2) Стандартний збір токенів
         collectTokens()
+
+        -- 3) Записуємо heatmap: де ми знаходимо токени
+        local nearby = findTokens(200)
+        for _, t in ipairs(nearby) do
+            if t.obj and t.obj.Parent then
+                local ok, p = pcall(function() return t.obj:GetPivot().Position end)
+                if ok then recordTokenSpawn(fieldName, p) end
+            end
+        end
+
+        -- 4) Record activity для depletion detection
+        recordFieldActivity(fieldName, #nearby)
+
+        -- 5) Якщо токенів мало — рух
+        if #nearby < 3 then
+            -- Спочатку до гарячої точки якщо вона є і ми не там
+            local hot = hottestSpot(fieldName)
+            if hot and (hrp.Position - hot).Magnitude > 40 then
+                walkToPoint(hot)
+            else
+                snakeMove(4)
+            end
+        end
+
+        -- 6) Field depletion check
+        if #nearby == 0 and lastTokenCount == 0 then
+            depletedChecks = depletedChecks + 1
+            if depletedChecks >= 3 then
+                print("[Brain] Field depleted: " .. fieldName .. " — leaving")
+                break
+            end
+        else
+            depletedChecks = 0
+        end
+        lastTokenCount = #nearby
+
+        -- 7) Risk re-check
+        if assessRisk() > 70 then
+            warn("[Brain] High risk → flee")
+            break
+        end
+
         if readBagFill() >= CFG.BagFullThreshold then break end
     end
+
+    -- Зберігаємо статистику
+    local timeSpent = tick() - farmStart
+    local endBag = readBagFill() or 0
+    local gained = math.max(0, endBag - startBag)
+    stat.timeSpent = stat.timeSpent + timeSpent
+    stat.bagGained = stat.bagGained + gained
+    if #findKillersNearby() > startKillers then
+        stat.killerCount = stat.killerCount + 1
+    end
+
     setSpeed(16)
 end
 
@@ -1620,13 +2313,40 @@ end)
 ------------------------------------------------------------
 print("[Macro] Сканування...")
 debugToast("Сканування гри...", Color3.fromRGB(80, 120, 200), 2)
+
+-- Чекаємо щоб персонаж повністю спавнувся
+local function waitForChar(timeout)
+    timeout = timeout or 15
+    local t0 = tick()
+    while tick() - t0 < timeout do
+        if LP.Character
+           and LP.Character:FindFirstChild("HumanoidRootPart")
+           and LP.Character:FindFirstChildWhichIsA("Humanoid")
+           and LP.Character.Humanoid.Health > 0 then
+            return true
+        end
+        task.wait(0.2)
+    end
+    return false
+end
+
+debugToast("Чекаю спавн персонажа...", Color3.fromRGB(80, 120, 200), 2)
+waitForChar(15)
+char, hrp, hum = getChar()
+
 local fields     = findFields()
 local dispensers = CFG.DoDispensers and findDispensers() or {}
-hive             = findHive()
+
+-- КРОК 1: Спочатку перевіряємо/клеймимо hive
+hive = ensureHiveClaimed()
 
 local fieldCount = 0; for _ in pairs(fields) do fieldCount = fieldCount + 1 end
 print(("[Macro] Fields=%d  Hive=%s  Dispensers=%d  UseItem=%s")
       :format(fieldCount, hive and hive.Name or "nil", #dispensers, tostring(UseItem ~= nil)))
+
+if not hive then
+    debugToast("⚠ Без hive макрос обмежений (тільки збір токенів)", Color3.fromRGB(220, 140, 50), 6)
+end
 
 ------------------------------------------------------------
 -- GUI
@@ -1972,7 +2692,7 @@ local function buildGUI()
 
     -- Статус
     local statusLbl = Instance.new("TextLabel", content)
-    statusLbl.Size = UDim2.new(1, -16, 0, 54)
+    statusLbl.Size = UDim2.new(1, -16, 0, 72)
     statusLbl.LayoutOrder = nextOrder()
     statusLbl.BackgroundColor3 = Color3.fromRGB(35, 37, 45)
     statusLbl.TextColor3 = Color3.fromRGB(180, 255, 180)
@@ -2133,12 +2853,18 @@ local function buildGUI()
         while gui.Parent do
             local fill = readBagFill()
             local fieldName = CFG.PreferredField or findCurrentField(fields) or "—"
+            local fsmState = (_G.BSSMacroFSM and _G.BSSMacroFSM.state) or "?"
+            local eta = bagETA()
+            local etaStr = eta == math.huge and "∞" or (math.floor(eta) .. "s")
+            local risk = assessRisk()
             statusLbl.Text = string.format(
-                "Поле: %s  |  Мішок: %d%%\nЧас: %s  |  Honey/h: %s\nDanger: %s  |  Pause: %s",
-                fieldName, math.floor(fill * 100),
-                sessionTime(),
+                "🤖 %s | Поле: %s | Risk: %d\nМішок: %d%% (ETA %s) | Honey/h: %s\nЧас: %s | Storm: %s | Bees: %d",
+                fsmState, fieldName, risk,
+                math.floor(fill * 100), etaStr,
                 tostring(honeyPerHour()),
-                tostring(state.inDanger), tostring(state.paused)
+                sessionTime(),
+                state.stormActive and "✓" or "—",
+                beeComposition.count
             )
             task.wait(1)
         end
@@ -2212,69 +2938,246 @@ pcall(setupAutoRejoin)
 
 webhook("🚀 Macro started", 0x66FF66)
 
+------------------------------------------------------------
+-- STATE MACHINE (розумний AI)
+------------------------------------------------------------
+local FSM = {
+    state    = "INIT",
+    lastChange = tick(),
+    lastBoss   = 0,
+    lastDispensers = 0,
+    lastClaims = 0,
+    deathStreak = 0,
+}
+_G.BSSMacroFSM = FSM  -- щоб GUI міг показувати поточний стан
+
+local function setState(s, reason)
+    if FSM.state ~= s then
+        print(string.format("[FSM] %s → %s (%s)", FSM.state, s, reason or ""))
+        FSM.state = s
+        FSM.lastChange = tick()
+    end
+end
+
+-- Smart decision з planner'ом і cost-benefit
+local function decideNextState()
+    local bagFill = readBagFill() or 0
+
+    -- ПРІОРИТЕТ 1: Hard safety
+    if state.inDanger then return "FLEEING" end
+    if needsHpRecovery() then return "HP_RECOVERY" end
+
+    -- ПРІОРИТЕТ 2: Hive
+    if not hive then return "CLAIMING_HIVE" end
+
+    -- ПРІОРИТЕТ 3: Мішок повний
+    if bagFill >= CFG.BagFullThreshold or state.returnNow then return "CONVERTING" end
+
+    -- ПРІОРИТЕТ 4: MEGA COMBO (storm + low bag + buffs available)
+    if state.stormActive and bagFill < 0.3 then return "MEGA_COMBO" end
+
+    -- ПРІОРИТЕТ 5: Goal queue
+    local goal = topGoal()
+    if goal then
+        if goal.type == "fight_boss" then return "BOSS" end
+        if goal.type == "collect" then return "FARMING" end
+    end
+
+    -- ПРІОРИТЕТ 6: Storm активний — звичайний фарм
+    if state.stormActive then return "FARMING" end
+
+    -- ПРІОРИТЕТ 7: Cost-benefit рішення між основними діями
+    --   Кожна дія: (expected_reward, time_cost, risk)
+    local candidates = {}
+
+    -- Farm: швидко, низький ризик, середня нагорода
+    local farmEV = evaluateAction("FARMING", 50, 60, assessRisk())
+    table.insert(candidates, { name = "FARMING", ev = farmEV })
+
+    -- Claims: середня нагорода, рідко, без ризику
+    if tick() - FSM.lastClaims > 600 then
+        table.insert(candidates, { name = "CLAIMING_EXTRAS",
+            ev = evaluateAction("CLAIMING_EXTRAS", 80, 90, 5) })
+    end
+
+    -- Boss: висока нагорода, дорого по часу, ризиковано
+    if state.bossMode and tick() - FSM.lastBoss > 900 then
+        table.insert(candidates, { name = "BOSS",
+            ev = evaluateAction("BOSS", 200, 120, 40) })
+    end
+
+    -- Dispensers: середньо
+    if CFG.DoDispensers and #dispensers > 0 and tick() - FSM.lastDispensers > 900 then
+        table.insert(candidates, { name = "DISPENSERS",
+            ev = evaluateAction("DISPENSERS", 60, 60, 5) })
+    end
+
+    -- Mob hunt: ситуативно
+    if state.mobMode and #findMobs() > 0 then
+        table.insert(candidates, { name = "MOB_HUNT",
+            ev = evaluateAction("MOB_HUNT", 70, 40, 20) })
+    end
+
+    -- Сортуємо за EV
+    table.sort(candidates, function(a, b) return a.ev > b.ev end)
+    return candidates[1] and candidates[1].name or "FARMING"
+end
+
+-- HANDLERS станів
+local handlers = {}
+
+handlers.CLAIMING_HIVE = function()
+    hive = ensureHiveClaimed()
+    if not hive then task.wait(10) end
+end
+
+handlers.FARMING = function()
+    if CFG.TrackStats then readGameStats() end
+    detectStorms()
+    detectEvents()
+    solveMemoryMatch()
+
+    local fn, fm = chooseBestField(fields)
+    if not fm then
+        -- Нема куди йти — patient idle
+        patientIdle()
+        return
+    end
+
+    useBuffs()
+
+    print("[FSM] Farming: " .. fn .. (currentEvent and (" [event: "..currentEvent.."]") or ""))
+    local before = readBagFill() or 0
+    local t0 = tick()
+
+    farmField(fm, fn)
+
+    -- Adaptive learning: записуємо outcome
+    local gained = (readBagFill() or 0) - before
+    local timeSpent = tick() - t0
+    recordOutcome("FARMING", gained * 100, timeSpent)
+end
+
+handlers.CONVERTING = function()
+    if hive then convertAtHive() end
+    state.returnNow = false
+end
+
+handlers.FLEEING = function()
+    smartFlee()
+    state.inDanger = false
+end
+
+handlers.HP_RECOVERY = function()
+    recoverHP()
+end
+
+handlers.MEGA_COMBO = function()
+    if not attemptMegaCombo() then
+        -- Якщо combo failed (без storm) — fallback на farm
+        handlers.FARMING()
+    end
+end
+
+handlers.DISPENSERS = function()
+    visitDispensers(dispensers)
+    FSM.lastDispensers = tick()
+    if hive then convertAtHive() end
+end
+
+handlers.BOSS = function()
+    fightBoss()
+    FSM.lastBoss = tick()
+    if hive then convertAtHive() end
+end
+
+handlers.MOB_HUNT = function()
+    huntMobs()
+    if hive then convertAtHive() end
+end
+
+handlers.CLAIMING_EXTRAS = function()
+    -- Всі periodic задачі за раз
+    processPlanters()
+    processCrafting()
+    processQuests()
+    processSprouts()
+    claimWealthClock()
+    processBeequips()
+    feedBees()
+    claimStickerStack()
+    claimDailyBonus()
+    claimGoo()
+    claimHoneysuckle()
+    claimBuoy()
+    goMountainTop()
+    collectCuckooDrops()
+    huntVicious()
+    redeemCodes()
+    -- Brain updates
+    readBeeComposition()
+    parseCurrentQuest()
+    FSM.lastClaims = tick()
+end
+
+-- Brain background: оновлення кожні 30с
+task.spawn(function()
+    while task.wait(30) do
+        if state.running then
+            pcall(readBeeComposition)
+            pcall(parseCurrentQuest)
+            pcall(detectEvents)
+            pcall(planAhead)
+            pruneGoals()
+        end
+    end
+end)
+
+-- Goal seeder: автоматично додає цілі на основі контексту
+task.spawn(function()
+    while task.wait(60) do
+        if state.running then
+            if currentEvent == "tunnel_day" then
+                addGoal("event_tunnel", "fight_boss", 80, 600, { boss = "Tunnel Bear" })
+            end
+            if currentEvent == "honey_day" then
+                addGoal("honey_day_farm", "collect", 75, 1200)
+            end
+            if currentQuest.objective then
+                addGoal("quest_active", "collect", 70, 600)
+            end
+        end
+    end
+end)
+
+-- DEATH-DETECTION + auto rejoin якщо помираємо багато
+LP.CharacterAdded:Connect(function()
+    FSM.deathStreak = FSM.deathStreak + 1
+    if FSM.deathStreak >= 4 then
+        warn("[FSM] 4 смерті підряд — server hop")
+        webhook("💀 4 deaths in a row — server hop", 0xFF6666)
+        FSM.deathStreak = 0
+        task.spawn(serverHop)
+    end
+    task.delay(120, function() FSM.deathStreak = math.max(0, FSM.deathStreak - 1) end)
+end)
+
+-- ГОЛОВНИЙ FSM LOOP
+setState("FARMING", "init")
+
 while state.running do
     local ok, err = pcall(function()
-        useBuffs()
-        if CFG.TrackStats then readGameStats() end
-
-        -- Storm boost (детект і використання)
-        local storm, stormText = detectStorms()
-        if storm then
-            print("[Macro] Storm detected: " .. (stormText or ""))
-            webhook("⛈️ Storm: " .. (stormText or ""), 0x00BFFF)
-        end
-
-        -- Memory Match minigame
-        solveMemoryMatch()
-
-        local fn = CFG.PreferredField or findCurrentField(fields)
-        local fm = fn and fields[fn] or select(2, next(fields))
-        if fm then
-            print("[Macro] Field: " .. fm.Name)
-            farmField(fm)
-        end
-
-        state.returnNow = false
-
-        if hive then convertAtHive() end
-
-        if CFG.DoDispensers and #dispensers > 0 then
-            visitDispensers(dispensers)
-            if hive then convertAtHive() end
-        end
-
-        if state.mobMode then huntMobs(); if hive then convertAtHive() end end
-        if state.bossMode then
-            fightBoss()
-            stats.bossesKilled = stats.bossesKilled + 1
-        end
-
-        processPlanters()
-        processCrafting()
-        processQuests()
-        processSprouts()
-        claimWealthClock()
-
-        -- Atlas-style фічі
-        processBeequips()
-        feedBees()
-        claimStickerStack()
-        claimDailyBonus()
-        claimGoo()
-        claimHoneysuckle()
-        claimBuoy()
-        activateHaste()
-        goMountainTop()
-        collectCuckooDrops()
-        huntVicious()
-        redeemCodes()
+        local nextS = decideNextState()
+        setState(nextS, "decide")
+        local h = handlers[nextS]
+        if h then h() end
     end)
     if not ok then
-        warn("[Macro] Err: " .. tostring(err))
-        webhook("❌ Error: " .. tostring(err):sub(1, 200), 0xFF0000)
-        task.wait(2)
+        warn("[FSM] Err: " .. tostring(err))
+        webhook("❌ FSM Error: " .. tostring(err):sub(1, 200), 0xFF0000)
+        task.wait(3)
     end
-    task.wait(0.4)
+    task.wait(0.3)
 end
 
 webhook("⏹️ Macro stopped. Honey: " .. stats.honeyMade .. " | Time: " .. sessionTime(), 0xFF6666)
